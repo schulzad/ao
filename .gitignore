@@ -365,6 +365,8 @@ third_party/glog/
 
 # Virtualenv
 venv/
+.venv/
+.python-version
 
 # Log files
 *.log
