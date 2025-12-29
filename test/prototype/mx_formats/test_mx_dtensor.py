@@ -59,13 +59,16 @@ def _test_dtensor_cast_to_mxfp8(mesh: DeviceMesh, size=4):
     local_rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
     assert size % world_size == 0, "unsupported"
-    x_fp8_fp32 = x_fp8.to_dtype(torch.float32)
+    x_fp8_fp32 = x_fp8.dequantize(torch.float32)
     rows_per_slice = size // world_size
     slice_start = local_rank * rows_per_slice
     slice_end = (local_rank + 1) * rows_per_slice
     x_fp8_fp32_slice = x_fp8_fp32[slice_start:slice_end]
     torch.testing.assert_close(
-        x_fp8_fp32_slice, dist_x_fp8.to_local().to_dtype(torch.float32), atol=0, rtol=0
+        x_fp8_fp32_slice,
+        dist_x_fp8.to_local().dequantize(torch.float32),
+        atol=0,
+        rtol=0,
     )
 
 
@@ -108,9 +111,9 @@ if __name__ == "__main__":
     tests = [
         _test_dtensor_cast_to_mxfp8,
         _test_mxfp8_mlp_tensor_parallelism,
-        _test_mxfp8_mlp_tensor_parallelism_dim1_triton,
     ]
     if is_sm_at_least_100():
+        tests.append(_test_mxfp8_mlp_tensor_parallelism_dim1_triton)
         tests.append(_test_mxfp8_mlp_tensor_parallelism_dim1_cuda)
 
     for test in tqdm(tests, desc="Running tests"):

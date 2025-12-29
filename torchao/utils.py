@@ -8,7 +8,6 @@ import importlib
 import itertools
 import re
 import time
-import warnings
 from functools import reduce
 from importlib.metadata import version
 from math import gcd
@@ -29,26 +28,18 @@ __all__ = [
     "get_model_size_in_bytes",
     "unwrap_tensor_subclass",
     "TorchAOBaseTensor",
+    "is_cuda_version_at_least",
     "is_MI300",
     "is_sm_at_least_89",
     "is_sm_at_least_90",
+    "is_sm_at_least_100",
     "is_package_at_least",
     "DummyModule",
-    # Deprecated
-    "TORCH_VERSION_AT_LEAST_2_2",
-    "TORCH_VERSION_AT_LEAST_2_3",
-    "TORCH_VERSION_AT_LEAST_2_4",
-    "TORCH_VERSION_AT_LEAST_2_5",
-    "TORCH_VERSION_AT_LEAST_2_6",
-    "TORCH_VERSION_AT_LEAST_2_7",
-    "TORCH_VERSION_AFTER_2_2",
-    "TORCH_VERSION_AFTER_2_3",
-    "TORCH_VERSION_AFTER_2_4",
-    "TORCH_VERSION_AFTER_2_5",
 ]
 
 
 # Referenced from: https://github.com/pytorch/pytorch/blob/9105d54c6b37099575c0059ef274c86c4dc80c57/torch/ao/quantization/utils.py#L711
+@functools.cache
 def _assert_and_get_unique_device(module: torch.nn.Module) -> Any:
     """
     Returns the unique device for a module, or None if no device is found.
@@ -121,6 +112,21 @@ def benchmark_model(model, num_runs, args=(), kwargs=None, device_type=None):
         average_time_per_run = (end_time - start_time) / num_runs
         return average_time_per_run
 
+    elif device_type == "xpu":
+        torch.xpu.synchronize()
+        start_event = torch.xpu.Event(enable_timing=True)
+        end_event = torch.xpu.Event(enable_timing=True)
+        start_event.record()
+
+        # benchmark
+        for _ in range(num_runs):
+            with torch.autograd.profiler.record_function("timed region"):
+                model(*args, **kwargs)
+
+        end_event.record()
+        torch.xpu.synchronize()
+        return start_event.elapsed_time(end_event) / num_runs
+
 
 def profiler_runner(path, fn, *args, **kwargs):
     with torch.profiler.profile(
@@ -144,6 +150,13 @@ def get_available_devices():
     if torch.mps.is_available():
         devices.append("mps")
     return devices
+
+
+def get_current_accelerator_device():
+    if torch.accelerator.is_available():
+        return torch.accelerator.current_accelerator()
+    else:
+        return None
 
 
 def get_compute_capability():
@@ -377,100 +390,51 @@ def torch_version_at_least(min_version):
     return parse_version(torch.__version__) >= parse_version(min_version)
 
 
-def _deprecated_torch_version_at_least(version_str: str) -> str:
-    """
-    Wrapper for existing TORCH_VERSION_AT_LEAST* variables that will log
-    a deprecation warning if the variable is used.
-    """
-    version_str_var_name = "_".join(version_str.split(".")[:2])
-    deprecation_msg = f"TORCH_VERSION_AT_LEAST_{version_str_var_name} is deprecated and will be removed in torchao 0.14.0"
-    return _BoolDeprecationWrapper(
-        torch_version_at_least(version_str),
-        deprecation_msg,
-    )
-
-
-def _deprecated_torch_version_after(version_str: str) -> str:
-    """
-    Wrapper for existing TORCH_VERSION_AFTER* variables that will log
-    a deprecation warning if the variable is used.
-    """
-    bool_value = is_fbcode() or version("torch") >= version_str
-    version_str_var_name = "_".join(version_str.split(".")[:2])
-    deprecation_msg = f"TORCH_VERSION_AFTER_{version_str_var_name} is deprecated and will be removed in torchao 0.14.0"
-    return _BoolDeprecationWrapper(bool_value, deprecation_msg)
-
-
-class _BoolDeprecationWrapper:
-    """
-    A deprecation wrapper that logs a warning when the given bool value is accessed.
-    """
-
-    def __init__(self, bool_value: bool, msg: str):
-        self.bool_value = bool_value
-        self.msg = msg
-
-    def __bool__(self):
-        warnings.warn(self.msg)
-        return self.bool_value
-
-    def __eq__(self, other):
-        return bool(self) == bool(other)
-
-
-# Deprecated, use `torch_version_at_least` directly instead
-TORCH_VERSION_AT_LEAST_2_8 = _deprecated_torch_version_at_least("2.8.0")
-TORCH_VERSION_AT_LEAST_2_7 = _deprecated_torch_version_at_least("2.7.0")
-TORCH_VERSION_AT_LEAST_2_6 = _deprecated_torch_version_at_least("2.6.0")
-TORCH_VERSION_AT_LEAST_2_5 = _deprecated_torch_version_at_least("2.5.0")
-TORCH_VERSION_AT_LEAST_2_4 = _deprecated_torch_version_at_least("2.4.0")
-TORCH_VERSION_AT_LEAST_2_3 = _deprecated_torch_version_at_least("2.3.0")
-TORCH_VERSION_AT_LEAST_2_2 = _deprecated_torch_version_at_least("2.2.0")
-TORCH_VERSION_AFTER_2_5 = _deprecated_torch_version_after("2.5.0.dev")
-TORCH_VERSION_AFTER_2_4 = _deprecated_torch_version_after("2.4.0.dev")
-TORCH_VERSION_AFTER_2_3 = _deprecated_torch_version_after("2.3.0.dev")
-TORCH_VERSION_AFTER_2_2 = _deprecated_torch_version_after("2.2.0.dev")
-
-
 """
 Helper function for implementing aten op or torch function dispatch
 and dispatching to these implementations.
 """
 
 
-def _implements(cls, aten_ops_or_torch_fns):
-    """Use this decorator to implement a function for an aten ops in __torch_dispatch__
-    (if user passed in a list of ops)
-    or torch function in __torch_function__ (if user passed in a single object)
-
-    class MyTensor(torch.Tensor):
-        ...
-        implements = classmethod(_implements)
-
-    implements = MyTensor.implements
-
-    @implements(torch.nn.functional.linear):
-    def _(func, types, args, kwargs):
-        ...
-
-    """
-    if not hasattr(cls, "_ATEN_OP_OR_TORCH_FN_TABLE"):
-        cls._ATEN_OP_OR_TORCH_FN_TABLE = {}
-
-    if cls not in cls._ATEN_OP_OR_TORCH_FN_TABLE:
-        cls._ATEN_OP_OR_TORCH_FN_TABLE[cls] = {}
-
-    if not isinstance(aten_ops_or_torch_fns, (list, tuple)):
-        aten_ops_or_torch_fns = [aten_ops_or_torch_fns]
+def _implements(cls, aten_ops):
+    """Decorator to implement aten ops for __torch_dispatch__."""
+    if not hasattr(cls, "_ATEN_OP_TABLE"):
+        cls._ATEN_OP_TABLE = {}
+    if cls not in cls._ATEN_OP_TABLE:
+        cls._ATEN_OP_TABLE[cls] = {}
+    if not isinstance(aten_ops, (list, tuple)):
+        aten_ops = [aten_ops]
 
     def decorator(func):
-        for op in aten_ops_or_torch_fns:
+        for op in aten_ops:
 
-            @functools.wraps(op)
-            def wrapper(f, types, args, kwargs):
-                return func(f, types, args, kwargs)
+            @functools.wraps(func)
+            def wrapper(f, types, args, kwargs, _func=func):
+                return _func(f, types, args, kwargs)
 
-            cls._ATEN_OP_OR_TORCH_FN_TABLE[cls][op] = wrapper
+            cls._ATEN_OP_TABLE[cls][op] = wrapper
+        return func
+
+    return decorator
+
+
+def _implements_torch_function(cls, torch_fns):
+    """Decorator to implement __torch_function__."""
+    if not hasattr(cls, "_TORCH_FN_TABLE"):
+        cls._TORCH_FN_TABLE = {}
+    if cls not in cls._TORCH_FN_TABLE:
+        cls._TORCH_FN_TABLE[cls] = {}
+    if not isinstance(torch_fns, (list, tuple)):
+        torch_fns = [torch_fns]
+
+    def decorator(func):
+        for fn in torch_fns:
+
+            @functools.wraps(func)
+            def wrapper(f, types, args, kwargs, _func=func):
+                return _func(f, types, args, kwargs)
+
+            cls._TORCH_FN_TABLE[cls][fn] = wrapper
         return func
 
     return decorator
@@ -478,9 +442,40 @@ def _implements(cls, aten_ops_or_torch_fns):
 
 def _implements_common_tensor_ops(cls):
     implements = cls.implements
+    implements_torch_function = cls.implements_torch_function
     aten = torch.ops.aten
 
-    @implements(
+    @implements(torch.ops.aten.to.dtype_layout)
+    def _(func, types, args, kwargs):
+        # only support kwargs for now
+        assert len(args) == 1
+        self = args[0]
+        # only support dtype, layout, and device for now
+        for k in kwargs.keys():
+            assert k in ["dtype", "layout", "device"]
+        # only support same dtype and layout
+        # different dtype and layout has undefined behavior
+        if "dtype" in kwargs:
+            assert kwargs["dtype"] == self.dtype
+        if "layout" in kwargs:
+            assert kwargs["layout"] == self.layout
+        # if device is the same, treat this like a no-op
+        device = kwargs.get("device")
+        if device == self.device:
+            return self
+        new_tensor = args[0]._apply_fn_to_data(lambda x: func(x, device=device))
+        return return_and_correct_aliasing(func, args, kwargs, new_tensor)
+
+    # This is called during _apply() to see if we can shallow
+    # copy the content of one tensor into another. For now,
+    # we only allow shallow copy if both tensors are of the
+    # same type and have the same shape.
+    @implements_torch_function(torch._has_compatible_shallow_copy_type)
+    def _(func, types, args, kwargs):
+        assert len(args) == 2
+        return type(args[0]) == type(args[1]) and args[0].shape == args[1].shape
+
+    @implements_torch_function(
         [
             torch.Tensor.contiguous,
         ]
@@ -513,9 +508,11 @@ def _implements_common_tensor_ops(cls):
         if hasattr(self, "optional_tensor_data_names"):
             # either both are None or both are not Tensors and the shape match
             _optional_tensor_shape_match = all(
-                getattr(self, t_name).shape == getattr(src, t_name).shape
-                if getattr(self, t_name) is not None
-                else getattr(src, t_name) is None
+                (
+                    getattr(self, t_name).shape == getattr(src, t_name).shape
+                    if getattr(self, t_name) is not None
+                    else getattr(src, t_name) is None
+                )
                 for t_name in self.optional_tensor_data_names
             )
 
@@ -628,12 +625,11 @@ def _dispatch__torch_function__(cls, func, types, args=(), kwargs=None):
     """
     kwargs = {} if kwargs is None else kwargs
     if (
-        hasattr(cls, "_ATEN_OP_OR_TORCH_FN_TABLE")
-        and cls in cls._ATEN_OP_OR_TORCH_FN_TABLE
-        and func in cls._ATEN_OP_OR_TORCH_FN_TABLE[cls]
+        hasattr(cls, "_TORCH_FN_TABLE")
+        and cls in cls._TORCH_FN_TABLE
+        and func in cls._TORCH_FN_TABLE[cls]
     ):
-        return cls._ATEN_OP_OR_TORCH_FN_TABLE[cls][func](func, types, args, kwargs)
-
+        return cls._TORCH_FN_TABLE[cls][func](func, types, args, kwargs)
     with torch._C.DisableTorchFunctionSubclass():
         return func(*args, **kwargs)
 
@@ -647,11 +643,11 @@ def _dispatch__torch_dispatch__(cls, func, types, args, kwargs):
         __torch_dispatch__ = classmethod(_dispatch__torch_dispatch__)
     """
     if (
-        hasattr(cls, "_ATEN_OP_OR_TORCH_FN_TABLE")
-        and cls in cls._ATEN_OP_OR_TORCH_FN_TABLE
-        and func in cls._ATEN_OP_OR_TORCH_FN_TABLE[cls]
+        hasattr(cls, "_ATEN_OP_TABLE")
+        and cls in cls._ATEN_OP_TABLE
+        and func in cls._ATEN_OP_TABLE[cls]
     ):
-        return cls._ATEN_OP_OR_TORCH_FN_TABLE[cls][func](func, types, args, kwargs)
+        return cls._ATEN_OP_TABLE[cls][func](func, types, args, kwargs)
 
     arg_types = tuple(type(arg) for arg in args)
     kwarg_types = {k: type(arg) for k, arg in kwargs.items()}
@@ -716,9 +712,7 @@ def _get_tensor_impl_constructor(
 
 def _get_to_kwargs(self, *args, **kwargs):
     # `torch._C._nn._parse_to` can't handle `layout` argument
-    for arg in args:
-        if isinstance(arg, torch.layout):
-            args.remove(arg)
+    args = tuple(arg for arg in args if not isinstance(arg, torch.layout))
     if "layout" in kwargs:
         kwargs.pop("layout")
     # ignoring `non_blocking` and `memory_format` args since these are not
@@ -832,11 +826,14 @@ class TorchAOBaseTensor(torch.Tensor):
 
     @classmethod
     def __init_subclass__(cls, **kwargs):
-        if not hasattr(cls, "_ATEN_OP_OR_TORCH_FN_TABLE"):
-            cls._ATEN_OP_OR_TORCH_FN_TABLE = {}
-
-        if cls not in cls._ATEN_OP_OR_TORCH_FN_TABLE:
-            cls._ATEN_OP_OR_TORCH_FN_TABLE[cls] = {}
+        if not hasattr(cls, "_ATEN_OP_TABLE"):
+            cls._ATEN_OP_TABLE = {}
+        if not hasattr(cls, "_TORCH_FN_TABLE"):
+            cls._TORCH_FN_TABLE = {}
+        if cls not in cls._ATEN_OP_TABLE:
+            cls._ATEN_OP_TABLE[cls] = {}
+        if cls not in cls._TORCH_FN_TABLE:
+            cls._TORCH_FN_TABLE[cls] = {}
 
         # define the common ops and __set_state__ for BC
         # if the tensor_data_names and tensor_attribute_names are defined
@@ -847,12 +844,13 @@ class TorchAOBaseTensor(torch.Tensor):
         # inherit the torch function and dispatch implementations from direct parent classes
         # e.g. for `class C(B, A)`, C.__bases__ == (B, A)
         for parent in cls.__bases__:
-            if parent in cls._ATEN_OP_OR_TORCH_FN_TABLE:
-                cls._ATEN_OP_OR_TORCH_FN_TABLE[cls].update(
-                    cls._ATEN_OP_OR_TORCH_FN_TABLE[parent]
-                )
+            if hasattr(cls, "_ATEN_OP_TABLE") and parent in cls._ATEN_OP_TABLE:
+                cls._ATEN_OP_TABLE[cls].update(cls._ATEN_OP_TABLE[parent])
+            if hasattr(cls, "_TORCH_FN_TABLE") and parent in cls._TORCH_FN_TABLE:
+                cls._TORCH_FN_TABLE[cls].update(cls._TORCH_FN_TABLE[parent])
 
     implements = classmethod(_implements)
+    implements_torch_function = classmethod(_implements_torch_function)
     _implements_common_tensor_ops = classmethod(_implements_common_tensor_ops)
     __torch_dispatch__ = classmethod(_dispatch__torch_dispatch__)
     __torch_function__ = classmethod(_dispatch__torch_function__)
@@ -1097,6 +1095,16 @@ def is_sm_at_least_100():
     )
 
 
+def is_cuda_version_at_least(major: int, minor: int) -> bool:
+    if not torch.cuda.is_available():
+        return False
+    cuda_version = torch.version.cuda
+    if cuda_version is None:
+        return False
+    cuda_major, cuda_minor = map(int, cuda_version.split(".")[:2])
+    return (cuda_major, cuda_minor) >= (major, minor)
+
+
 def check_cpu_version(device, version="2.6.0"):
     if isinstance(device, torch.device):
         device = device.type
@@ -1121,10 +1129,13 @@ def is_package_at_least(package_name: str, min_version: str):
     return version(package_name) >= min_version
 
 
-def _is_fbgemm_genai_gpu_available():
+def _is_fbgemm_gpu_genai_available():
     # TODO: use is_package_at_least("fbgemm_gpu", "1.2.0") when
     # https://github.com/pytorch/FBGEMM/issues/4198 is fixed
-    if importlib.util.find_spec("fbgemm_gpu") is None:
+    if (
+        importlib.util.find_spec("fbgemm_gpu") is None
+        or importlib.util.find_spec("fbgemm_gpu.experimental") is None
+    ):
         return False
 
     import fbgemm_gpu.experimental.gen_ai  # noqa: F401
@@ -1133,6 +1144,13 @@ def _is_fbgemm_genai_gpu_available():
         return False
 
     return True
+
+
+def _is_mslk_available():
+    if is_fbcode():
+        return True
+
+    return importlib.util.find_spec("mslk") is not None
 
 
 class DummyModule(torch.nn.Module):

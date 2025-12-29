@@ -41,11 +41,6 @@ from .granularity import (
     PerRow,
     PerTensor,
 )
-from .subclass import (  # noqa
-    Int8DynamicallyQuantizedLinearWeight,
-    Int8WeightOnlyQuantizedLinearWeight,
-    QuantizedLinearWeightBase,
-)
 
 __all__ = [
     "AutoQuantizableLinearWeight",
@@ -729,7 +724,7 @@ class AQGemliteInt4G32WeightOnlyQuantizedLinearWeight(
     @classmethod
     def from_float(cls, weight):
         from torchao.dtypes import to_affine_quantized_intx
-        from torchao.dtypes.uintx.gemlite_layout import get_gemlite_aqt_kwargs
+        from torchao.prototype.dtypes.uintx.gemlite_layout import get_gemlite_aqt_kwargs
 
         if weight.dtype != torch.float16:
             weight = weight.to(torch.float16)
@@ -833,7 +828,8 @@ class Float32Tensor(TorchAOBaseTensor):
         return cls(weight)
 
 
-@Float32Tensor.implements([torch.nn.functional.linear, aten.linear.default])
+@Float32Tensor.implements_torch_function(torch.nn.functional.linear)
+@Float32Tensor.implements(aten.linear.default)
 def _(func, types, args, kwargs):
     input_tensor, weight_tensor, bias = (
         args[0],

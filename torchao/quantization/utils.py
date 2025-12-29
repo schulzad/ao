@@ -3,7 +3,8 @@
 
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
-from typing import Dict, List, Optional
+import logging
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
@@ -29,6 +30,19 @@ from torchao.utils import (
     check_xpu_version,
 )
 
+from .granularity import (
+    Granularity,
+    PerAxis,
+    PerBlock,
+    PerGroup,
+    PerRow,
+    PerTensor,
+    PerToken,
+)
+from .linear_activation_quantized_tensor import (
+    LinearActivationQuantizedTensor,
+)
+
 __all__ = [
     "compute_error",
     "_quantize_activation_per_token_absmax",
@@ -47,6 +61,8 @@ __all__ = [
     "get_group_qparams_symmetric",
     "recommended_inductor_config_setter",
 ]
+
+logger = logging.getLogger(__name__)
 
 
 # basic SQNR
@@ -678,3 +694,100 @@ def recommended_inductor_config_setter():
     torch._inductor.config.fx_graph_cache = True
     torch._inductor.config.triton.unique_kernel_names = True
     torch.set_float32_matmul_precision("high")
+
+
+def get_block_size(
+    input_shape: Tuple[int, ...], granularity: Granularity
+) -> Tuple[int, ...]:
+    """Get the block size based on the input shape and granularity type.
+    Args:
+        input_shape: The input tensor shape possibly more than 2 dimensions
+        granularity: The granularity type of the quantization
+    """
+    if isinstance(granularity, PerTensor):
+        return input_shape
+    elif isinstance(granularity, PerAxis):
+        block_size = list(input_shape)
+        block_size[granularity.axis] = 1
+        return tuple(block_size)
+    elif isinstance(granularity, PerBlock):
+        block_size = granularity.block_size
+
+        # pad the start of `block_size` with 1s, to make 2d block_size
+        # handle tensors of rank 3+
+        if len(block_size) < len(input_shape):
+            block_size_list = list(block_size)
+            while len(block_size_list) < len(input_shape):
+                block_size_list.insert(0, 1)
+            block_size = tuple(block_size_list)
+
+        assert len(block_size) == len(input_shape), (
+            f"Block size {block_size} must have the same number of dimensions as input shape {input_shape}"
+        )
+        for i in range(len(block_size)):
+            assert input_shape[i] % block_size[i] == 0, (
+                f"Not all shapes in input shape {input_shape} are divisible by block size {block_size}"
+            )
+        return block_size
+    elif isinstance(granularity, PerToken):
+        return (1,) * (len(input_shape) - 1) + (input_shape[-1],)
+    elif isinstance(granularity, PerRow):
+        block_size = [1] * len(input_shape)
+        block_size[granularity.dim] = input_shape[granularity.dim]
+        return tuple(block_size)
+    elif isinstance(granularity, PerGroup):
+        assert input_shape[-1] % granularity.group_size == 0, (
+            f"Last dimension of input {input_shape[-1]} is not divisible by group size {granularity.group_size}"
+        )
+        return (1,) * (len(input_shape) - 1) + (granularity.group_size,)
+    raise ValueError(f"Unsupported Granularity: {granularity}")
+
+
+def _quantization_type(weight: torch.Tensor):
+    # prevent circular import
+    from torchao.dtypes import AffineQuantizedTensor
+
+    if isinstance(weight, AffineQuantizedTensor):
+        return f"{weight.__class__.__name__}({weight._quantization_type()})"
+
+    if isinstance(weight, LinearActivationQuantizedTensor):
+        return f"{weight.__class__.__name__}(activation={weight.input_quant_func}, weight={_quantization_type(weight.original_weight_tensor)})"
+
+    if hasattr(weight, "_quantization_type"):
+        return f"{weight.__class__.__name__}({weight._quantization_type()})"
+
+    if type(weight) is torch.Tensor or isinstance(weight, torch.nn.Parameter):
+        return f"Tensor: {type(weight)}"
+
+    return f"not recognized: {type(weight)}"
+
+
+def _linear_extra_repr(self):
+    return f"in_features={self.weight.shape[1]}, out_features={self.weight.shape[0]}, weight={_quantization_type(self.weight)}"
+
+
+def _fp8_mm_compat(weight: torch.Tensor) -> bool:
+    """
+    Check if a weight tensor meets float8 quantization requirements.
+
+    Args:
+        weight (torch.Tensor): The weight tensor to check
+
+    Returns:
+        bool: True if the tensor can be quantized to float8, False otherwise
+    """
+    assert weight.dim() in [
+        2,
+        3,
+    ], f"float8 quantization only works for 2/3-D tensors, got {weight.dim()}D tensor"
+
+    out_dim, in_dim = weight.shape[-2:]
+    is_compatible = (in_dim % 16 == 0) and (out_dim % 16 == 0)
+
+    if not is_compatible:
+        logger.info(
+            f"Skipping float8 quantization: weight shape {weight.shape} is not compatible with _scaled_mm. "
+            f"Both input dimension ({in_dim}) and output dimension ({out_dim}) must be multiples of 16. "
+        )
+
+    return is_compatible

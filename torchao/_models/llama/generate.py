@@ -40,31 +40,23 @@ class HostEvent:
         return abs(other_event.event_time - self.event_time) * 1000
 
 
-def device_timer(device):
-    if "cuda" in device:
-        return torch.cuda.Event(enable_timing=True)
+def device_timer(device: str):
+    if device in ["cuda", "xpu"]:
+        return torch.Event(enable_timing=True)
     elif ("cpu" in device) or ("mps" in device):
         return HostEvent()
     else:
         print(f"device={device} is not yet suppported")
 
 
-def device_sync(device):
-    if "cuda" in device:
-        torch.cuda.synchronize(device)
-    elif "xpu" in device:
-        torch.xpu.synchronize(device)
-    elif ("cpu" in device) or ("mps" in device):
-        pass
-    else:
-        print(f"device={device} is not yet suppported")
+def device_sync(device: str):
+    if torch.accelerator.is_available():
+        torch.accelerator.synchronize(device)
 
 
 default_device = (
-    "cuda"
-    if torch.cuda.is_available()
-    else "xpu"
-    if torch.xpu.is_available()
+    acc.type
+    if (acc := torch.accelerator.current_accelerator(check_available=True))
     else "cpu"
 )
 
@@ -158,10 +150,10 @@ def generate(
     kv_cache_quantization: bool = False,
     cache_size: Optional[int] = None,
     linear_causal_mask: bool = False,
-    prefill_start_event: Optional[torch.cuda.Event] = None,
-    prefill_end_event: Optional[torch.cuda.Event] = None,
-    decode_start_event: Optional[torch.cuda.Event] = None,
-    decode_end_event: Optional[torch.cuda.Event] = None,
+    prefill_start_event: Optional[torch.Event] = None,
+    prefill_end_event: Optional[torch.Event] = None,
+    decode_start_event: Optional[torch.Event] = None,
+    decode_end_event: Optional[torch.Event] = None,
     **sampling_kwargs,
 ) -> torch.Tensor:
     """
@@ -279,8 +271,8 @@ def main(
     compile_prefill: bool = False,
     profile: Optional[Path] = None,
     memory_profile: Optional[Path] = None,
-    device=default_device,
-    precision=torch.bfloat16,
+    device: str = default_device,
+    precision: torch.dtype = torch.bfloat16,
     write_result: Optional[Path] = None,
     output_json_path: Optional[Path] = None,
     output_json_local: bool = False,
@@ -338,18 +330,18 @@ def main(
     if quantization:
         from torchao.quantization import (
             Float8DynamicActivationFloat8SemiSparseWeightConfig,
+            Float8DynamicActivationFloat8WeightConfig,
+            Float8WeightOnlyConfig,
+            FPXWeightOnlyConfig,
+            GemliteUIntXWeightOnlyConfig,
+            Int4DynamicActivationInt4WeightConfig,
+            Int4WeightOnlyConfig,
+            Int8DynamicActivationInt4WeightConfig,
+            Int8DynamicActivationInt8WeightConfig,
+            Int8WeightOnlyConfig,
+            UIntXWeightOnlyConfig,
             autoquant,
-            float8_dynamic_activation_float8_weight,
-            float8_weight_only,
-            fpx_weight_only,
-            gemlite_uintx_weight_only,
-            int4_dynamic_activation_int4_weight,
-            int4_weight_only,
-            int8_dynamic_activation_int4_weight,
-            int8_dynamic_activation_int8_weight,
-            int8_weight_only,
             quantize_,
-            uintx_weight_only,
         )
         from torchao.quantization.granularity import PerRow, PerTensor
 
@@ -373,7 +365,7 @@ def main(
 
             quantize_(
                 model,
-                gemlite_uintx_weight_only(
+                GemliteUIntXWeightOnlyConfig(
                     bit_width=bit_width, group_size=group_size, mode=mode
                 ),
             )
@@ -393,25 +385,28 @@ def main(
             gemlite.cache_config(config_file)
 
         if "int8wo" in quantization:
-            quantize_(model, int8_weight_only())
+            quantize_(model, Int8WeightOnlyConfig())
         if "int8dq" in quantization:
             if sparsity and "semi" in sparsity:
                 from torchao.dtypes import SemiSparseLayout
 
                 quantize_(
                     model,
-                    int8_dynamic_activation_int8_weight(layout=SemiSparseLayout()),
+                    Int8DynamicActivationInt8WeightConfig(layout=SemiSparseLayout()),
                     filter_fn=ffn_only,
                 )
                 quantize_(
-                    model, int8_dynamic_activation_int8_weight(), filter_fn=not_ffn_only
+                    model,
+                    Int8DynamicActivationInt8WeightConfig(),
+                    filter_fn=not_ffn_only,
                 )
             elif "int8dq_prefill_wo_decode" in quantization:
                 quantize_(
-                    model, int8_dynamic_activation_int8_weight(weight_only_decode=True)
+                    model,
+                    Int8DynamicActivationInt8WeightConfig(weight_only_decode=True),
                 )
             else:
-                quantize_(model, int8_dynamic_activation_int8_weight())
+                quantize_(model, Int8DynamicActivationInt8WeightConfig())
         if "int4wo" in quantization:
             use_hqq = False
             if "hqq" in quantization:
@@ -425,25 +420,9 @@ def main(
             ], (
                 f"int4wo group_size needs to be one of [32,64,128,256] but got {group_size}"
             )
-            quantize_(model, int4_weight_only(group_size=group_size, use_hqq=use_hqq))
-        elif "fbgemm" in quantization and "int4" in quantization:
-            from torchao.quantization import FbgemmConfig
-
-            _, precision, group_size = quantization.split("-")
-            group_size = int(group_size)
-            block_size = [1, group_size]
-            assert precision == "int4", f"FbegemmConfig({precision=}) not supported yet"
             quantize_(
                 model,
-                FbgemmConfig(torch.bfloat16, torch.int4, torch.bfloat16, block_size),
-            )
-        elif "fbgemm" in quantization and "fp8" in quantization:
-            from torchao.float8.config import e4m3_dtype
-            from torchao.quantization import FbgemmConfig
-
-            quantize_(
-                model,
-                FbgemmConfig(e4m3_dtype, e4m3_dtype, torch.bfloat16),
+                Int4WeightOnlyConfig(group_size=group_size, use_hqq=use_hqq, version=1),
             )
         elif "int4dq-" in quantization:
             from torchao.dtypes import CutlassInt4PackedLayout
@@ -453,7 +432,7 @@ def main(
             if nbits == 4:
                 quantize_(
                     model,
-                    int4_dynamic_activation_int4_weight(
+                    Int4DynamicActivationInt4WeightConfig(
                         mapping_type=MappingType.SYMMETRIC,
                         act_mapping_type=MappingType.SYMMETRIC,
                         layout=CutlassInt4PackedLayout(),
@@ -462,7 +441,7 @@ def main(
             elif nbits == 8:
                 quantize_(
                     model,
-                    int8_dynamic_activation_int4_weight(
+                    Int8DynamicActivationInt4WeightConfig(
                         group_size=None,
                         mapping_type=MappingType.SYMMETRIC,
                         act_mapping_type=MappingType.SYMMETRIC,
@@ -471,11 +450,11 @@ def main(
                 )
         if "marlin" in quantization:
             if "qqq" in quantization:
-                from torchao.dtypes import MarlinQQQLayout
+                from torchao.prototype.dtypes import MarlinQQQLayout
 
                 quantize_(
                     model,
-                    int8_dynamic_activation_int4_weight(
+                    Int8DynamicActivationInt4WeightConfig(
                         group_size=128,
                         mapping_type=MappingType.SYMMETRIC,
                         act_mapping_type=MappingType.SYMMETRIC,
@@ -487,15 +466,15 @@ def main(
 
                 quantize_(
                     model,
-                    int4_weight_only(layout=MarlinSparseLayout()),
+                    Int4WeightOnlyConfig(layout=MarlinSparseLayout(), version=1),
                     filter_fn=ffn_or_attn_only,
                 )
         if "fp6" in quantization:
-            quantize_(model, fpx_weight_only(3, 2))
+            quantize_(model, FPXWeightOnlyConfig(3, 2))
         elif "embed-int8wo" in quantization:
             quantize_(
                 model,
-                int8_weight_only(group_size=64),
+                Int8WeightOnlyConfig(group_size=64),
                 filter_fn=lambda x, *args: isinstance(x, torch.nn.Embedding),
             )
         elif quantization.startswith("awq"):
@@ -555,13 +534,12 @@ def main(
             }
             dtype = _NBITS_TO_DTYPE[nbits]
             group_size = int(_quant_args[2])
-            quantize_(model, uintx_weight_only(dtype, group_size, use_hqq=use_hqq))
+            quantize_(model, UIntXWeightOnlyConfig(dtype, group_size, use_hqq=use_hqq))
         elif "int8_dynamic_activation_intx_weight" in quantization:
             assert precision == torch.float32, (
                 "int8_dynamic_activation_intx_weight requires using precision=torch.float32"
             )
 
-            from torchao.dtypes import PackedLinearInt8DynamicActivationIntxWeightLayout
             from torchao.quantization.granularity import PerAxis, PerGroup
             from torchao.quantization.quant_api import (
                 Int8DynamicActivationIntxWeightConfig,
@@ -581,12 +559,11 @@ def main(
                     weight_mapping_type=MappingType.ASYMMETRIC
                     if is_asymmetric
                     else MappingType.SYMMETRIC,
-                    weight_scale_dtype=torch.bfloat16,
-                    layout=PackedLinearInt8DynamicActivationIntxWeightLayout(),
+                    intx_packing_format="opaque_torchao_auto",
                 ),
             )
         elif "float8wo" in quantization:
-            quantize_(model, float8_weight_only())
+            quantize_(model, Float8WeightOnlyConfig())
         elif "float8dq" in quantization:
             if sparsity and "semi" in sparsity:
                 quantize_(
@@ -604,7 +581,7 @@ def main(
                     granularity = PerTensor()
                 quantize_(
                     model,
-                    float8_dynamic_activation_float8_weight(granularity=granularity),
+                    Float8DynamicActivationFloat8WeightConfig(granularity=granularity),
                 )
         elif "autoquant_v2" in quantization:
             from torchao._models._eval import LMEvalInputRecorder
@@ -619,7 +596,7 @@ def main(
                     prepare_inputs_for_model,
                     False,  # pad_calibration_inputs
                     model.config.vocab_size,
-                    device="cuda",
+                    device=device,
                 )
                 .record_inputs(
                     ["wikitext"],
@@ -629,7 +606,7 @@ def main(
                 .values[0]
             )
             inputs = prepare_inputs_for_model(inputs)
-            with torch.device("cuda"):
+            with torch.device(device):
                 model.setup_caches(
                     max_batch_size=1, max_seq_length=calibration_seq_length
                 )
@@ -896,10 +873,7 @@ def main(
 
     for i in range(start, num_samples):
         if i == 0:
-            if device == "cuda":
-                torch.cuda.reset_peak_memory_stats()  # MKG
-            elif device == "xpu":
-                torch.xpu.reset_peak_memory_stats()  # MKG
+            torch.accelerator.reset_peak_memory_stats()  # MKG
         device_sync(device=device)  # MKG
         if i >= 0 and interactive:
             prompt = input("What is your prompt? ")
@@ -1029,14 +1003,10 @@ def main(
         torch.tensor(aggregate_metrics["decode_tokens_per_sec"])
     ).item()
     bandwidth = model_size * tokpersec
-    mem = torch.cuda.max_memory_reserved() / 1e9
     print(f"Average overall tokens/sec: {tokpersec:.2f}")
     print(f"Average decode tokens/sec: {decode_tokpersec:.04f} s")
     print(f"Average TTFT: {ttft:.04f} s")
-    if device == "cuda":
-        mem = torch.cuda.max_memory_reserved() / 1e9
-    elif device == "xpu":
-        mem = torch.xpu.max_memory_reserved() / 1e9
+    mem = torch.accelerator.max_memory_reserved() / 1e9
     print(f"Average tokens/sec: {tokpersec:.2f}")
     if batch_size > 1:
         print(f"Average tokens/sec including batches {batch_size * tokpersec:.2f}")

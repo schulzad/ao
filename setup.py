@@ -5,18 +5,22 @@
 
 import copy
 import glob
+import json
 import os
+import pickle
 import subprocess
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import List, Optional
 
 from setuptools import Extension, find_packages, setup
+from setuptools.command.build_py import build_py as build_py_orig
 
 current_date = datetime.now().strftime("%Y%m%d")
 
-PY3_9_HEXCODE = "0x03090000"
+min_supported_cpython_hexcode = "0x030A0000"  # Python 3.10 hexcode
 
 
 def get_git_commit_id():
@@ -38,6 +42,41 @@ def read_requirements(file_path):
 def read_version(file_path="version.txt"):
     with open(file_path, "r") as file:
         return file.readline().strip()
+
+
+SPINQUANT_REL_PATH = Path("torchao") / "prototype" / "spinquant"
+HADAMARD_JSON = "_hadamard_matrices.json"
+HADAMARD_PKL = "_hadamard_matrices.pkl"
+
+
+def ensure_hadamard_pickle(root_dir: Optional[Path] = None, *, quiet: bool = True):
+    """
+    Guarantee that the Hadamard pickle exists (and is newer than the JSON source)
+    so setup.py packaging has an observable, reproducible rule.
+    """
+
+    base_dir = (
+        Path(root_dir) if root_dir is not None else Path(__file__).parent.resolve()
+    )
+    spinquant_dir = base_dir / SPINQUANT_REL_PATH
+    json_path = spinquant_dir / HADAMARD_JSON
+    if not json_path.exists():
+        return
+
+    pkl_path = spinquant_dir / HADAMARD_PKL
+    if pkl_path.exists() and pkl_path.stat().st_mtime >= json_path.stat().st_mtime:
+        return
+
+    with json_path.open("r") as source:
+        raw_matrices = json.load(source)
+
+    pkl_path.parent.mkdir(parents=True, exist_ok=True)
+    with pkl_path.open("wb") as sink:
+        pickle.dump(raw_matrices, sink, protocol=pickle.HIGHEST_PROTOCOL)
+
+    if not quiet:
+        rel_path = pkl_path.relative_to(base_dir)
+        print(f"[setup.py] regenerated {rel_path} from JSON source")
 
 
 # Use Git commit ID if VERSION_SUFFIX is not set
@@ -290,6 +329,10 @@ def get_cutlass_build_flags():
         )
 
 
+def bool_to_on_off(value):
+    return "ON" if value else "OFF"
+
+
 # BuildExtension is a subclass of from setuptools.command.build_ext.build_ext
 class TorchAOBuildExt(BuildExtension):
     def __init__(self, *args, **kwargs) -> None:
@@ -314,8 +357,11 @@ class TorchAOBuildExt(BuildExtension):
     def build_cmake(self, ext):
         extdir = os.path.abspath(os.path.dirname(self.get_ext_fullpath(ext.name)))
 
-        if not os.path.exists(self.build_temp):
-            os.makedirs(self.build_temp)
+        # Use a unique build directory per CMake extension to avoid cache conflicts
+        # when multiple extensions use different CMakeLists.txt source directories
+        ext_build_temp = os.path.join(self.build_temp, ext.name.replace(".", "_"))
+        if not os.path.exists(ext_build_temp):
+            os.makedirs(ext_build_temp)
 
         # Get the expected extension file name that Python will look for
         # We force CMake to use this library name
@@ -323,7 +369,7 @@ class TorchAOBuildExt(BuildExtension):
         ext_basename = os.path.splitext(ext_filename)[0]
 
         print(
-            "CMAKE COMMANG",
+            "CMAKE COMMAND",
             [
                 "cmake",
                 ext.cmake_lists_dir,
@@ -345,9 +391,9 @@ class TorchAOBuildExt(BuildExtension):
                 "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=" + extdir,
                 "-DTORCHAO_CMAKE_EXT_SO_NAME=" + ext_basename,
             ],
-            cwd=self.build_temp,
+            cwd=ext_build_temp,
         )
-        subprocess.check_call(["cmake", "--build", "."], cwd=self.build_temp)
+        subprocess.check_call(["cmake", "--build", "."], cwd=ext_build_temp)
 
 
 class CMakeExtension(Extension):
@@ -398,7 +444,7 @@ def get_extensions():
 
     extra_link_args = []
     extra_compile_args = {
-        "cxx": [f"-DPy_LIMITED_API={PY3_9_HEXCODE}"],
+        "cxx": [f"-DPy_LIMITED_API={min_supported_cpython_hexcode}"],
         "nvcc": nvcc_args if use_cuda else rocm_args,
     }
 
@@ -502,7 +548,8 @@ def get_extensions():
         # Remove csrc/cpu/*.cpp
         excluded_sources = list(
             glob.glob(
-                os.path.join(extensions_dir, "cpu/aten_kernels/*.cpp"), recursive=False
+                os.path.join(extensions_dir, "cpu", "aten_kernels", "*.cpp"),
+                recursive=False,
             )
         )
         sources = [s for s in sources if s not in excluded_sources]
@@ -670,20 +717,23 @@ def get_extensions():
             print("Building mxfp8_cuda extension")
             ext_modules.append(
                 CUDAExtension(
-                    name="torchao.prototype.mxfp8_cuda",
+                    name="torchao._C_mxfp8",
                     sources=mxfp8_sources,
                     include_dirs=[
                         mxfp8_extension_dir,  # For mxfp8_quantize.cuh, mxfp8_extension.cpp, and mxfp8_cuda.cu
-                        "/usr/local/cuda-12.8/include",  # CUDA 12.8 headers
-                    ],
-                    library_dirs=[
-                        "/usr/local/cuda-12.8/lib64",  # CUDA 12.8 libraries
                     ],
                     extra_compile_args={
-                        "cxx": ["-std=c++17", "-O3"],
-                        "nvcc": nvcc_args,
+                        "cxx": [
+                            f"-DPy_LIMITED_API={min_supported_cpython_hexcode}",
+                            "-std=c++17",
+                            "-O3",
+                        ],
+                        "nvcc": nvcc_args
+                        + [
+                            "-gencode=arch=compute_100,code=sm_100",
+                            "-gencode=arch=compute_120,code=compute_120",
+                        ],
                     },
-                    extra_link_args=["-lcuda", "-lcudart"],
                 ),
             )
 
@@ -733,9 +783,6 @@ def get_extensions():
     if build_macos_arm_auto or os.getenv("BUILD_TORCHAO_EXPERIMENTAL") == "1":
         build_options = BuildOptions()
 
-        def bool_to_on_off(value):
-            return "ON" if value else "OFF"
-
         from distutils.sysconfig import get_python_lib
 
         torch_dir = get_python_lib() + "/torch/share/cmake/Torch"
@@ -760,7 +807,28 @@ def get_extensions():
             )
         )
 
+        if build_options.build_experimental_mps:
+            ext_modules.append(
+                CMakeExtension(
+                    "torchao._C_mps",
+                    cmake_lists_dir="torchao/experimental/ops/mps",
+                    cmake_args=(
+                        [
+                            f"-DCMAKE_BUILD_TYPE={'Debug' if use_debug_mode() else 'Release'}",
+                            f"-DTORCHAO_BUILD_MPS_OPS={bool_to_on_off(build_options.build_experimental_mps)}",
+                            "-DTorch_DIR=" + torch_dir,
+                        ]
+                    ),
+                )
+            )
+
     return ext_modules
+
+
+class TorchAOBuildPy(build_py_orig):
+    def run(self):
+        ensure_hadamard_pickle()
+        super().run()
 
 
 # Only check submodules if we're going to build C++ extensions
@@ -774,6 +842,10 @@ setup(
     include_package_data=True,
     package_data={
         "torchao.kernel.configs": ["*.pkl"],
+        "torchao.prototype.spinquant": [
+            "_hadamard_matrices.json",
+            "_hadamard_matrices.pkl",
+        ],
     },
     ext_modules=get_extensions(),
     extras_require={"dev": read_requirements("dev-requirements.txt")},
@@ -781,6 +853,6 @@ setup(
     long_description=open("README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
     url="https://github.com/pytorch/ao",
-    cmdclass={"build_ext": TorchAOBuildExt},
-    options={"bdist_wheel": {"py_limited_api": "cp39"}},
+    cmdclass={"build_ext": TorchAOBuildExt, "build_py": TorchAOBuildPy},
+    options={"bdist_wheel": {"py_limited_api": "cp310"}},
 )

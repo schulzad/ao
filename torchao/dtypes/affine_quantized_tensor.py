@@ -136,7 +136,8 @@ class AffineQuantizedTensor(TorchAOBaseTensor):
         if output_dtype is None:
             output_dtype = self.dtype
 
-        from torchao.dtypes.floatx import Float8Layout, FloatxTensorCoreLayout
+        from torchao.dtypes.floatx import Float8Layout
+        from torchao.prototype.dtypes.floatx import FloatxTensorCoreLayout
 
         if isinstance(self._layout, FloatxTensorCoreLayout):
             int_data, scale = self.tensor_impl.get_plain()
@@ -245,6 +246,9 @@ class AffineQuantizedTensor(TorchAOBaseTensor):
         zero_point_domain: ZeroPointDomain = ZeroPointDomain.INT,
         _layout: Layout = PlainLayout(),
         use_hqq: bool = False,
+        *,
+        custom_scale: Optional[torch.Tensor] = None,
+        custom_zero_point: Optional[torch.Tensor] = None,
     ):
         """Convert a high precision tensor to an integer affine quantized tensor."""
         original_shape = input_float.shape
@@ -288,7 +292,13 @@ class AffineQuantizedTensor(TorchAOBaseTensor):
             )
             data = data.to(target_dtype)
         else:
-            if zero_point_domain == ZeroPointDomain.FLOAT and not preserve_zero:
+            if custom_scale is None != custom_zero_point is None:
+                raise ValueError(
+                    "`custom_scale` and `custom_zero_point` must be both defined or both None"
+                )
+            if custom_scale is not None and custom_zero_point is not None:
+                scale, zero_point = custom_scale, custom_zero_point
+            elif zero_point_domain == ZeroPointDomain.FLOAT and not preserve_zero:
                 scale, zero_point = _choose_qparams_affine_tinygemm(
                     input_float,
                     mapping_type,
@@ -530,7 +540,7 @@ class AffineQuantizedTensor(TorchAOBaseTensor):
         _layout: Layout,
     ):
         """Create a floatx AffineQuantizedTensor from a high precision tensor. Floatx is represented as ebits and mbits, and supports the representation of float1-float7."""
-        from torchao.dtypes.floatx import FloatxTensorCoreLayout
+        from torchao.prototype.dtypes.floatx import FloatxTensorCoreLayout
 
         assert isinstance(_layout, FloatxTensorCoreLayout), (
             f"Only FloatxTensorCoreLayout is supported for floatx, got {_layout}"

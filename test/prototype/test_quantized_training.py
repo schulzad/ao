@@ -211,7 +211,9 @@ class TestQuantizedTraining(TestCase):
 
         def snr(ref, actual):
             error = actual - ref
-            return 20 * torch.log10(ref.norm() / error.norm())
+            return 20 * torch.log10(
+                torch.linalg.vector_norm(ref) / torch.linalg.vector_norm(error)
+            )
 
         assert snr(outputs_ref, outputs_int8mp) > 20
         assert snr(inputs_ref.grad, inputs_int8mp.grad) > 20
@@ -294,6 +296,7 @@ class TestFSDP2(FSDPTest):
         return _FSDP_WORLD_SIZE
 
     @skip_if_lt_x_gpu(_FSDP_WORLD_SIZE)
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_fsdp2_correctness(self):
         mp_policy = MixedPrecisionPolicy()
 
@@ -384,6 +387,7 @@ class TestFSDP2(FSDPTest):
             )
 
     @skip_if_lt_x_gpu(_FSDP_WORLD_SIZE)
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_precompute_bitnet_scale(self):
         from torchao.prototype.quantized_training.bitnet import (
             get_bitnet_scale,

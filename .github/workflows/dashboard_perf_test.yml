@@ -10,6 +10,7 @@ on:
 
 jobs:
   benchmark:
+    timeout-minutes: 500
     runs-on: linux.aws.a100
     strategy:
       matrix:
@@ -30,7 +31,7 @@ jobs:
           ${CONDA_RUN} python -m pip install --upgrade pip
           ${CONDA_RUN} pip install ${{ matrix.torch-spec }}
           ${CONDA_RUN} pip install -r dev-requirements.txt
-          ${CONDA_RUN} pip install .
+          ${CONDA_RUN} pip install . --no-build-isolation
           # SAM 2.1
           ${CONDA_RUN} pip install -r examples/sam2_amg_server/requirements.txt
 

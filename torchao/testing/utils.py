@@ -16,8 +16,9 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 )
 
 import torchao
+from torchao.core.config import AOBaseConfig
 from torchao.dtypes import AffineQuantizedTensor, to_affine_quantized_intx
-from torchao.quantization import int8_weight_only, quantize_
+from torchao.quantization import Int8WeightOnlyConfig, quantize_
 from torchao.quantization.quant_primitives import MappingType
 from torchao.quantization.transform_module import (
     _QUANTIZE_CONFIG_HANDLER,
@@ -26,6 +27,7 @@ from torchao.testing.model_architectures import LlamaModelsLlama4Experts
 from torchao.utils import (
     DummyModule,
     get_compute_capability,
+    get_current_accelerator_device,
 )
 
 """
@@ -90,6 +92,69 @@ def skip_if_rocm(message=None):
         return wrapper
 
     # Handle both @skip_if_rocm and @skip_if_rocm() syntax
+    if callable(message):
+        func = message
+        message = None
+        return decorator(func)
+    return decorator
+
+
+def skip_if_no_xpu():
+    try:
+        import pytest
+
+        has_pytest = True
+    except ImportError:
+        has_pytest = False
+        import unittest
+
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            if not torch.xpu.is_available():
+                skip_message = "No XPU available"
+                if has_pytest:
+                    pytest.skip(skip_message)
+                else:
+                    unittest.skip(skip_message)
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def skip_if_xpu(message=None):
+    """
+    Decorator to skip tests on XPU platform with custom message.
+
+    Args:
+        message (str, optional): Additional information about why the test is skipped.
+    """
+    try:
+        import pytest
+
+        has_pytest = True
+    except ImportError:
+        has_pytest = False
+        import unittest
+
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            if torch.xpu.is_available():
+                skip_message = "Skipping the test in XPU"
+                if message:
+                    skip_message += f": {message}"
+                if has_pytest:
+                    pytest.skip(skip_message)
+                else:
+                    unittest.skip(skip_message)
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    # Handle both @skip_if_xpu and @skip_if_xpu() syntax
     if callable(message):
         func = message
         message = None
@@ -331,7 +396,7 @@ class TorchAOTensorParallelTestCase(DTensorTestBase):
     COMMON_DTYPES = [torch.float32, torch.float16, torch.bfloat16]
 
     TENSOR_SUBCLASS = AffineQuantizedTensor
-    QUANT_METHOD_FN = staticmethod(int8_weight_only)
+    QUANT_METHOD_FN = staticmethod(Int8WeightOnlyConfig)
     QUANT_METHOD_KWARGS = {}
 
     @staticmethod
@@ -426,24 +491,27 @@ class TorchAOTensorParallelTestCase(DTensorTestBase):
 
 
 class TorchAOIntegrationTestCase(common_utils.TestCase):
-    def _test_slice_and_copy_similar_to_vllm(self, config):
+    def _test_slice_and_copy_similar_to_vllm(self, config: AOBaseConfig):
         # making sure https://github.com/vllm-project/vllm/blob/90bd2ab6e3eb7e83d3f40d99fc23e6e43834743a/vllm/model_executor/layers/linear.py#L483-L495 works properly
         # the test is similar to the linked code, but with some hardcoded arguments
         # and does not use tensor parallelism
 
         dtype = torch.bfloat16
-        device = "cuda"
-        l = torch.nn.Linear(1024, 1024, device="cuda", dtype=dtype)
+        assert torch.accelerator.is_available(), "no accelerator device found"
+        device = get_current_accelerator_device()
+        l = torch.nn.Linear(1024, 1024, device=device, dtype=dtype)
         quantize_(l, config)
 
         # high level, we do a narrow for both param.data and the loaded_weights
         # and do inplace copy_ to copy from the loaded_weights into param.data
 
         # simulate loaded_weight
-        dummy_l = torch.nn.Linear(1024, 1024).to("cuda").to(torch.bfloat16)
+        dummy_l = torch.nn.Linear(1024, 1024).to(device).to(torch.bfloat16)
         # making the weight different
         dummy_l.weight = torch.nn.Parameter(
-            dummy_l.weight + 2 * torch.randn(1024, 1024, device=device, dtype=dtype),
+            dummy_l.weight
+            + 1.0
+            + 2 * torch.randn(1024, 1024, device=device, dtype=dtype),
             requires_grad=False,
         )
         quantize_(dummy_l, config)
@@ -455,15 +523,15 @@ class TorchAOIntegrationTestCase(common_utils.TestCase):
             param = l.weight
             param_data = param.data
             param_data = param_data.narrow(output_dim, start_idx, shard_size)
-            orig_value = param_data.qdata[0][0]
+            orig_values = param_data.qdata[0]
             loaded_weight = dummy_l.weight
             loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
 
-            # making sure param.data.qdata[0][0] is not the same as loaded_weight.qdata[0][0]
-            assert not torch.equal(orig_value, loaded_weight.qdata[0][0])
+            # making sure param.data.qdata[0] is not the same as loaded_weight.qdata[0]
+            assert not torch.equal(orig_values, loaded_weight.qdata[0])
             param_data.copy_(loaded_weight)
             # making sure param.data is updated to loaded_weight
-            assert torch.equal(param_data.qdata[0][0], loaded_weight.qdata[0][0])
+            assert torch.equal(param_data.qdata[0], loaded_weight.qdata[0])
             if hasattr(param_data, "scale"):
                 assert torch.equal(param_data.scale, loaded_weight.scale)
             if hasattr(param_data, "zero_point"):
@@ -606,6 +674,46 @@ class TorchAOIntegrationTestCase(common_utils.TestCase):
         moe_combined.load_state_dict(new_state_dict, assign=True)
         # make sure it runs
         moe_combined(input)
+
+    def _test_narrow_similar_to_vllm(self, config: AOBaseConfig):
+        # this happens various times in vllm when slicing weights around
+
+        dtype = torch.bfloat16
+        l = torch.nn.Linear(1024, 1024, device="cuda", dtype=dtype)
+        quantize_(l, config)
+
+        orig = l.weight
+        new = orig.narrow(1, 0, 1024)
+
+        for data_attr_name in new.tensor_data_names:
+            orig_attr = getattr(orig, data_attr_name)
+            new_attr = getattr(new, data_attr_name)
+            assert len(orig_attr.shape) == len(new_attr.shape), (
+                f"shape mismatch: {orig_attr.shape} vs {new_attr.shape}"
+            )
+
+    def _test_quantize_3d_param_similar_to_vllm(self, config: AOBaseConfig):
+        # this happens when vLLM loads empty MoE weights, quantizes
+        # them, and stitches 2d params from the checkpoint into a 3d param
+        # in memory
+
+        dtype = torch.bfloat16
+        with torch.device("meta"):
+            l = torch.nn.Linear(1024, 1024, device="cuda", dtype=dtype)
+        l.weight = torch.nn.Parameter(
+            torch.randn(60, 2816, 2048, device="cuda", dtype=dtype)
+        )
+        quantize_(l, config)
+        _w_slice = l.weight[0]
+
+    def _test_chunk_similar_to_vllm_llama4(self, ao_tensor, dim):
+        # source code in vLLM LLaMa 4:
+        # https://github.com/vllm-project/vllm/blob/34553b9d2702dd2a27a578fec819e88e76dcbfb4/vllm/model_executor/models/llama4.py#L455
+        ao_tensor_chunked = ao_tensor.chunk(2, dim=dim)
+        ao_tensor_unchunked = torch.cat(ao_tensor_chunked, dim=dim)
+        torch.testing.assert_close(
+            ao_tensor.dequantize(), ao_tensor_unchunked.dequantize(), atol=0, rtol=0
+        )
 
 
 common_utils.instantiate_parametrized_tests(TorchAOBasicTestCase)
