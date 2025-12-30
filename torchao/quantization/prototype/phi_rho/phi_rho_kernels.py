@@ -4,7 +4,14 @@ import torch
 
 
 @torch.no_grad()
-def generate_phi_rho_codebook(min_value: torch.Tensor, max_value: torch.Tensor, num_entries: int, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+def generate_phi_rho_codebook(
+    min_value: torch.Tensor,
+    max_value: torch.Tensor,
+    num_entries: int,
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
     """Generate a deterministic codebook in [min_value, max_value] using cosine-spaced nodes.
 
     We use Chebyshev-like nodes mapped to the data range for good coverage;
@@ -45,10 +52,10 @@ def assign_via_bucketize(values: torch.Tensor, codebook: torch.Tensor) -> torch.
 
 
 @torch.no_grad()
-def quantize_values(values: torch.Tensor, codebook: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def quantize_values(
+    values: torch.Tensor, codebook: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return (indices, dequant) where dequant = codebook[indices]."""
     indices = assign_via_bucketize(values, codebook)
     dequant = codebook[indices]
     return indices, dequant
-
-
