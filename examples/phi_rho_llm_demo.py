@@ -72,33 +72,11 @@ def main():
     orig_memory = get_memory_mb(model_orig)
     print(f"Original model memory: {orig_memory:.1f} MB")
     
-    # Create a quantized copy
-    print("Creating Phi-Rho quantized copy...")
-    model_quant = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.float16,
-        device_map=device,
-    )
-    model_quant.eval()
-    
-    # Replace Linear layers
-    config = PhiRhoCodebookConfig(num_codebook_entries=256)
-    num_replaced = replace_linear_with_phi_rho(model_quant, config)
-    print(f"Replaced {num_replaced} Linear layers with PhiRhoLinear")
-    
-    # Measure quantized memory
-    quant_memory = get_memory_mb(model_quant)
-    print(f"Quantized model memory: {quant_memory:.1f} MB")
-    print(f"Memory reduction: {(1 - quant_memory/orig_memory)*100:.1f}%")
-    
-    # Test generation
+    # --- Baseline generation ---
     prompt = "The quick brown fox"
     print(f"\nPrompt: '{prompt}'")
-    
+    print(f"\n--- Original Model Baseline ---")
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
-    
-    # Original model generation
-    print("\n--- Original Model ---")
     t0 = time.time()
     with torch.no_grad():
         outputs_orig = model_orig.generate(
@@ -109,37 +87,63 @@ def main():
         )
     t_orig = time.time() - t0
     text_orig = tokenizer.decode(outputs_orig[0], skip_special_tokens=True)
-    print(f"Output: {text_orig}")
     print(f"Time: {t_orig:.2f}s")
+    print(f"Output: {text_orig}")
+    del model_orig  # Free memory
+    torch.cuda.empty_cache()
+
+    # --- Test Quantization Levels ---
+    bit_widths = [8, 9, 10]
     
-    # Quantized model generation
-    print("\n--- Phi-Rho Quantized Model ---")
-    t0 = time.time()
-    with torch.no_grad():
-        outputs_quant = model_quant.generate(
-            **inputs,
-            max_new_tokens=50,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id,
+    for bits in bit_widths:
+        K = 2**bits
+        print(f"\n--- Phi-Rho {bits}-bit ({K} entries) ---")
+        
+        # Reload model fresh
+        print(f"Loading fresh model for {bits}-bit quantization...")
+        model_quant = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float16,
+            device_map=device,
         )
-    t_quant = time.time() - t0
-    text_quant = tokenizer.decode(outputs_quant[0], skip_special_tokens=True)
-    print(f"Output: {text_quant}")
-    print(f"Time: {t_quant:.2f}s")
-    
-    # Compare
-    print("\n--- Comparison ---")
-    if text_orig == text_quant:
-        print("✅ Outputs are IDENTICAL!")
-    else:
-        print("⚠️  Outputs differ (expected with quantization)")
-        # Show first difference
-        for i, (c1, c2) in enumerate(zip(text_orig, text_quant)):
-            if c1 != c2:
-                print(f"   First diff at char {i}: '{c1}' vs '{c2}'")
+        model_quant.eval()
+        
+        # Quantize
+        start_quant = time.time()
+        config = PhiRhoCodebookConfig(num_codebook_entries=K)
+        num_replaced = replace_linear_with_phi_rho(model_quant, config)
+        quant_time = time.time() - start_quant
+        
+        mem_mb = get_memory_mb(model_quant)
+        print(f"Quantized in {quant_time:.2f}s. Memory: {mem_mb:.1f} MB (Reduction: {(1 - mem_mb/orig_memory)*100:.1f}%)")
+        
+        # Generate
+        t0 = time.time()
+        with torch.no_grad():
+            outputs_quant = model_quant.generate(
+                **inputs,
+                max_new_tokens=50,
+                do_sample=False,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+        t_quant = time.time() - t0
+        text_quant = tokenizer.decode(outputs_quant[0], skip_special_tokens=True)
+        
+        print(f"Gen Time: {t_quant:.2f}s")
+        if text_quant == text_orig:
+            print("Quality: ✅ Identical to Baseline")
+        else:
+            print("Quality: ⚠️  Differs")
+            print(f"Output: {text_quant}")
+        
+        # Check first linear layer for index dtype
+        for m in model_quant.modules():
+            if isinstance(m, PhiRhoLinear):
+                print(f"Storage Type: {m.weight_indices.dtype}")
                 break
-    
-    print(f"\nSpeedup: {t_orig/t_quant:.2f}x")
+        
+        del model_quant
+        torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

@@ -37,43 +37,56 @@ def main():
         f"Benchmarking Phi-Rho Inference MM ({M}x{K} @ {K}x{N}) on {torch.cuda.get_device_name(0)}"
     )
 
-    # Data
-    a = torch.randn(M, K, device=device, dtype=dtype)
-    # B Indices (Uint8) simulating quantized weights
-    b_indices = torch.randint(0, 256, (K, N), device=device, dtype=torch.uint8)
-    # Codebook (256, )
-    codebook = torch.randn(256, device=device, dtype=dtype)
+    # Test both 8-bit (uint8) and 9-bit (int16)
+    for bits in [8, 9]:
+        num_entries = 2 ** bits
+        idx_dtype = torch.uint8 if bits <= 8 else torch.int16
+        print(f"\n--- Testing {bits}-bit ({num_entries} entries, dtype={idx_dtype}) ---")
 
-    # Reference (De-quantized)
-    b_ref = codebook[b_indices.long()]  # Materialize float matrix [K, N]
+        # Data
+        a = torch.randn(M, K, device=device, dtype=dtype)
+        # B Indices
+        if bits > 8:
+            b_indices = torch.randint(0, num_entries, (K, N), device=device, dtype=torch.int16)
+        else:
+            b_indices = torch.randint(0, num_entries, (K, N), device=device, dtype=torch.uint8)
+            
+        # Codebook
+        codebook = torch.randn(num_entries, device=device, dtype=dtype)
 
-    # 1. Run Standard Matmul (Ideal Baseline - if weights were already float)
-    # This measures pure compute bound.
-    triton_time = bench(lambda: torch.matmul(a, b_ref))
-    print(f"FP16 MM (Baseline): {triton_time * 1000:.3f} ms")
+        # Reference (De-quantized)
+        # Handle negative int16 indices if any (though randint(0, 512) should be positive)
+        # b_indices.long() correctly handles int16
+        b_ref = codebook[b_indices.long()]
 
-    # 2. Run Phi-Rho Fused Kernel
-    # This fuses the lookup. It should ideally be competitive with FP16 MM
-    # but wins on memory bandwidth (fetching uint8 instead of fp16).
-    try:
-        phi_rho_time = bench(lambda: run_phi_rho_mm(a, b_indices, codebook))
-        print(f"Phi-Rho Fused MM:   {phi_rho_time * 1000:.3f} ms")
-        print(f"Speedup vs FP16:    {triton_time / phi_rho_time:.2f}x")
-    except Exception as e:
-        print(f"Phi-Rho Failed: {e}")
+        # 1. FP16 Baseline
+        triton_time = bench(lambda: torch.matmul(a, b_ref))
+        print(f"FP16 MM (Baseline): {triton_time * 1000:.3f} ms")
 
-    # Check Correctness
-    out_phi = run_phi_rho_mm(a, b_indices, codebook)
-    out_ref = torch.matmul(a, b_ref)
+        # 2. Phi-Rho
+        try:
+            phi_rho_time = bench(lambda: run_phi_rho_mm(a, b_indices, codebook))
+            print(f"Phi-Rho Fused MM:   {phi_rho_time * 1000:.3f} ms")
+            print(f"Speedup vs FP16:    {triton_time / phi_rho_time:.2f}x")
+        except Exception as e:
+            print(f"Phi-Rho Failed: {e}")
+            import traceback
+            traceback.print_exc()
 
-    # Tolerances for half precision
-    # Note: atomic Adds in triton vs PyTorch accum order might cause slight diffs
-    if torch.allclose(out_phi, out_ref, atol=1e-2, rtol=1e-2):
-        print("Correctness: PASS")
-    else:
-        diff = (out_phi - out_ref).abs().max().item()
-        print(f"Correctness: FAIL (Max Diff: {diff})")
+        # Check Correctness
+        try:
+            out_phi = run_phi_rho_mm(a, b_indices, codebook)
+            out_ref = torch.matmul(a, b_ref)
+
+            if torch.allclose(out_phi, out_ref, atol=1e-2, rtol=1e-2):
+                print("Correctness: PASS")
+            else:
+                diff = (out_phi - out_ref).abs().max().item()
+                print(f"Correctness: FAIL (Max Diff: {diff})")
+        except Exception as e:
+             print(f"Correctness Check Failed: {e}")
 
 
 if __name__ == "__main__":
     main()
+

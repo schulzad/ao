@@ -64,8 +64,15 @@ class PhiRhoLinear(nn.Module):
         # Quantize the weight
         q = PhiRhoCodebookQuantizedTensor.from_float(linear.weight, config)
         
-        # Store indices as uint8 and codebook
-        layer.weight_indices = q.indices.to(torch.uint8)
+        # Store indices. Use uint8 if valid, else int16 (or int32)
+        if config.num_codebook_entries <= 256:
+            layer.weight_indices = q.indices.to(torch.uint8)
+        elif config.num_codebook_entries <= 32768:
+            # PyTorch doesn't fully support uint16, so we use int16
+            layer.weight_indices = q.indices.to(torch.int16)
+        else:
+            layer.weight_indices = q.indices.to(torch.int32)
+
         layer.codebook = q.codebook.to(dtype)
         
         # Copy bias if present
@@ -104,4 +111,7 @@ class PhiRhoLinear(nn.Module):
         return out
     
     def extra_repr(self) -> str:
-        return f"in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}"
+        s = f"in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}"
+        if self.weight_indices is not None:
+            s += f", index_dtype={self.weight_indices.dtype}"
+        return s

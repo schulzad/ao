@@ -88,7 +88,7 @@ def main():
     print(f"Running on {device.upper()}")
 
     N = 1_000_000
-    K = 256
+    N = 1_000_000
     distributions = ["normal", "uniform", "lognormal", "bimodal"]
 
     # Reproducibility
@@ -96,62 +96,67 @@ def main():
 
     results = []
 
+    bit_widths = [5, 6, 8, 9]
+
     for dist in distributions:
-        print(f"Benchmarking {dist}...")
+        print(f"\nBenchmarking {dist}...")
         x = get_data(dist, N, device)
         x_min, x_max = x.min().item(), x.max().item()
 
-        # --- Phi-Rho ---
-        cfg = PhiRhoCodebookConfig(num_codebook_entries=K)
+        for bits in bit_widths:
+            K = 2 ** bits
+            
+            # --- Phi-Rho ---
+            cfg = PhiRhoCodebookConfig(num_codebook_entries=K)
 
-        def run_phi_rho():
-            PhiRhoCodebookQuantizedTensor.from_float(x, cfg)
+            def run_phi_rho():
+                PhiRhoCodebookQuantizedTensor.from_float(x, cfg)
 
-        phi_s = bench(run_phi_rho)
+            phi_s = bench(run_phi_rho)
 
-        # Calc MSE
-        q_phi = PhiRhoCodebookQuantizedTensor.from_float(x, cfg)
-        phi_mse = torch.mean((q_phi.to_float() - x) ** 2).item()
+            # Calc MSE
+            q_phi = PhiRhoCodebookQuantizedTensor.from_float(x, cfg)
+            phi_mse = torch.mean((q_phi.to_float() - x) ** 2).item()
 
-        # --- Baseline (K-Means) ---
-        # We'll use the local implementation for consistency unless import logic is restored
-        def run_baseline():
+            # --- Baseline (K-Means) ---
+            # We'll use the local implementation for consistency
+            def run_baseline():
+                centers = local_kmeans_1d(x, K, iters=8)
+                assign = torch.bucketize(x, (centers[1:] + centers[:-1]) * 0.5)
+                _ = centers[assign]
+
+            base_s = bench(run_baseline)
+
+            # Calc MSE
             centers = local_kmeans_1d(x, K, iters=8)
             assign = torch.bucketize(x, (centers[1:] + centers[:-1]) * 0.5)
-            # simulate construction cost
-            _ = centers[assign]
+            base_mse = torch.mean((centers[assign] - x) ** 2).item()
 
-        base_s = bench(run_baseline)
-
-        # Calc MSE
-        centers = local_kmeans_1d(x, K, iters=8)
-        assign = torch.bucketize(x, (centers[1:] + centers[:-1]) * 0.5)
-        base_mse = torch.mean((centers[assign] - x) ** 2).item()
-
-        results.append(
-            {
-                "Distribution": dist,
-                "Range": f"[{x_min:.1f}, {x_max:.1f}]",
-                "Phi-Rho (s)": phi_s,
-                "Baseline (s)": base_s,
-                "Speedup": base_s / phi_s,
-                "Phi-Rho MSE": phi_mse,
-                "Base MSE": base_mse,
-                "MSE Ratio": phi_mse / base_mse,
-            }
-        )
+            results.append(
+                {
+                    "Distribution": dist,
+                    "Bits": bits,
+                    "K": K,
+                    "Phi-Rho (s)": phi_s,
+                    "Baseline (s)": base_s,
+                    "Speedup": base_s / phi_s,
+                    "Phi-Rho MSE": phi_mse,
+                    "Base MSE": base_mse,
+                    "MSE Ratio": phi_mse / base_mse,
+                }
+            )
 
     if HAS_TABULATE:
         print(tabulate(results, headers="keys", floatfmt=".5f"))
     else:
         # Simple markdown table fallback
         print(
-            "| Dist | Phi-Rho (s) | Base (s) | Speedup | Phi-Rho MSE | Base MSE | Ratio |"
+            "| Dist | Bits | K | Phi-Rho (s) | Base (s) | Speedup | Phi-Rho MSE | Base MSE | Ratio |"
         )
-        print("|---|---|---|---|---|---|---|")
+        print("|---|---|---|---|---|---|---|---|---|")
         for r in results:
             print(
-                f"| {r['Distribution']} | {r['Phi-Rho (s)']:.5f} | {r['Baseline (s)']:.5f} | {r['Speedup']:.2f}x | {r['Phi-Rho MSE']:.5f} | {r['Base MSE']:.5f} | {r['MSE Ratio']:.2f} |"
+                f"| {r['Distribution']} | {r['Bits']} | {r['K']} | {r['Phi-Rho (s)']:.5f} | {r['Baseline (s)']:.5f} | {r['Speedup']:.2f}x | {r['Phi-Rho MSE']:.5f} | {r['Base MSE']:.5f} | {r['MSE Ratio']:.2f} |"
             )
 
 

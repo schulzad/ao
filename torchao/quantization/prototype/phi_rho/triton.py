@@ -3,27 +3,6 @@ import triton
 import triton.language as tl
 
 
-def get_configs():
-    configs = []
-    for num_stages in [2, 3, 4, 5]:
-        for block_m in [16, 32, 64, 128]:
-            for block_n in [32, 64, 128]:
-                for block_k in [32, 64]:
-                    for num_warps in [2, 4, 8]:
-                        configs.append(
-                            triton.Config(
-                                {
-                                    "BLOCK_M": block_m,
-                                    "BLOCK_N": block_n,
-                                    "BLOCK_K": block_k,
-                                },
-                                num_stages=num_stages,
-                                num_warps=num_warps,
-                            )
-                        )
-    return configs
-
-
 @triton.jit
 def phi_rho_mm_kernel(
     # Pointers
@@ -57,7 +36,6 @@ def phi_rho_mm_kernel(
     pid = tl.program_id(axis=0)
 
     # 1D launch grid
-    # grid_m is not needed for coordinate calculation
     grid_n = tl.cdiv(N, BLOCK_N)
 
     # Standard tiling logic (pid -> pid_m, pid_n)
@@ -76,10 +54,10 @@ def phi_rho_mm_kernel(
     # Accumulator
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    # Load codebook into SRAM (it's small, 256 elements)
-    # We can rely on L1 cache for this since it's constant access pattern
-    # But explicitly loading might be tricky if we don't know the dtype size per se in python
-    # For now, we do indirect loads in the loop.
+    # Explicitly load codebook into SRAM via a dummy load
+    # This ensures the codebook is pulled into L1 cache for the subsequent random accesses
+    codebook_offsets = tl.arange(0, 256)
+    _ = tl.load(codebook_ptr + codebook_offsets)
 
     for k in range(0, K, BLOCK_K):
         # Load A [BLOCK_M, BLOCK_K]
@@ -89,11 +67,9 @@ def phi_rho_mm_kernel(
         b_idx = tl.load(b_ptrs, mask=offs_k[:, None] < K - k, other=0)
 
         # Dequantize B: lookup in codebook
-        # b_idx is uint8 [0..255], codebook is [256]
-        # values = codebook[indices]
-        # Pointers to codebook: codebook_ptr + index
+        # We use .ca (Cache All) modifier to hint that these random accesses should hit L1
         b_val_ptrs = codebook_ptr + b_idx.to(tl.int32)
-        b_val = tl.load(b_val_ptrs)
+        b_val = tl.load(b_val_ptrs, cache_modifier=".ca") 
 
         # Dot product
         accumulator += tl.dot(a, b_val)
@@ -111,9 +87,9 @@ def phi_rho_mm_kernel(
 
 
 def run_phi_rho_mm(a, b_indices, codebook):
-    # Checks
     assert a.is_cuda and b_indices.is_cuda and codebook.is_cuda
     assert a.ndim == 2 and b_indices.ndim == 2
+    assert b_indices.dtype in [torch.uint8, torch.int16, torch.int32, torch.long], f"Unsupported index dtype: {b_indices.dtype}"
     assert a.shape[1] == b_indices.shape[0], "K dimension mismatch"
 
     M, K = a.shape
@@ -127,12 +103,7 @@ def run_phi_rho_mm(a, b_indices, codebook):
         triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
     )
 
-    # Configs
-    # In a real scenario we'd use autotuner. For prototype we might pick a safe one or use the list
-    # Let's try to just run one config for "correctness" first, then autotune.
-    # We'll use a simplified autotuner call or manual launch for now to avoid dependency hell if autotuner imports fail
-
-    # Using manual launch for the prototype "first pass"
+    # Manual config for fast startup
     BLOCK_M = 128
     BLOCK_N = 64
     BLOCK_K = 32
